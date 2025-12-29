@@ -5,3 +5,9 @@
 .vscode/
 .devcontainer/
 dependencies.lock
+sdkconfig
+sdkconfig.old
+sdkconfig.defaults
+build/
+dependencies.lock
+managed_components/
