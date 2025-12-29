@@ -5,7 +5,12 @@
 
 void app_main(void)
 {
-    bsp_display_start();
+    lv_disp_t *disp = bsp_display_start();
+    
+    bsp_display_lock(0);
+    lv_disp_set_rotation(disp, LV_DISP_ROTATION_270);
+    bsp_display_unlock();
+    
     bsp_display_backlight_on();
     
     vTaskDelay(pdMS_TO_TICKS(500));
@@ -21,14 +26,6 @@ void app_main(void)
     lv_obj_set_style_text_font(label, &lv_font_montserrat_36, LV_PART_MAIN);
     lv_obj_center(label);
     
-    lv_obj_invalidate(screen);
-    
-    bsp_display_unlock();
-    
-    vTaskDelay(pdMS_TO_TICKS(100));
-    
-    bsp_display_lock(0);
-    lv_refr_now(NULL);
     bsp_display_unlock();
     
     while (1) {
