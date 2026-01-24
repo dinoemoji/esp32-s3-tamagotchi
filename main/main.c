@@ -1,131 +1,167 @@
-#include <stdio.h>
-#include <string.h>
+#include <inttypes.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "driver/gpio.h"
+#include "esp_err.h"
+#include "nvs.h"
+#include "nvs_flash.h"
 #include "bsp/esp32_s3_touch_amoled_1_8.h"
-#include "esp_codec_dev.h"
 #include "lvgl.h"
+#if CONFIG_PM_ENABLE
+#include "esp_pm.h"
+#endif
 
-#define BTN_INC   GPIO_NUM_18
-#define BTN_DEC   GPIO_NUM_39
-#define BTN_RESET GPIO_NUM_42
+LV_IMAGE_DECLARE(tamagotchi_bg);
+LV_IMAGE_DECLARE(write_icon);
+LV_IMAGE_DECLARE(log_icon);
+LV_IMAGE_DECLARE(trophy_icon);
+LV_IMAGE_DECLARE(settings_icon);
+extern const lv_font_t lv_font_unscii_16;
 
-// Declare embedded audio files
-extern const uint8_t inc_wav_start[] asm("_binary_inc_wav_start");
-extern const uint8_t inc_wav_end[] asm("_binary_inc_wav_end");
-extern const uint8_t dec_wav_start[] asm("_binary_dec_wav_start");
-extern const uint8_t dec_wav_end[] asm("_binary_dec_wav_end");
-extern const uint8_t reset_wav_start[] asm("_binary_reset_wav_start");
-extern const uint8_t reset_wav_end[] asm("_binary_reset_wav_end");
+static lv_obj_t *icon_write;
+static lv_obj_t *icon_log;
+static lv_obj_t *icon_trophy;
+static lv_obj_t *icon_settings;
+static lv_obj_t *words_value_label;
+static lv_obj_t *words_value_label_bold;
+static lv_obj_t *words_bar;
+static lv_obj_t *health_segments[6];
+static int32_t words_count = 0;
+static int32_t health_count = 6;
 
-static esp_codec_dev_handle_t spk_codec_dev = NULL;
-
-// Audio playback state
-static struct {
-    const uint8_t *wav_start;
-    const uint8_t *wav_end;
-    bool play_requested;
-    bool is_playing;
-} audio_state = {0};
-
-static void buttons_init(void)
+static void load_persisted_state(void)
 {
-    gpio_config_t io = {0};
-    io.mode = GPIO_MODE_INPUT;
-    io.pull_up_en = GPIO_PULLUP_ENABLE;
-    io.intr_type = GPIO_INTR_DISABLE;
-    io.pin_bit_mask =
-        (1ULL << BTN_INC) |
-        (1ULL << BTN_DEC) |
-        (1ULL << BTN_RESET);
-    gpio_config(&io);
-}
-
-// Initialize audio using BSP
-static void audio_init(void)
-{
-    printf("Initializing audio...\n");
-    
-    // Use BSP function to initialize codec
-    spk_codec_dev = bsp_audio_codec_speaker_init();
-    
-    if (spk_codec_dev == NULL) {
-        printf("ERROR: BSP audio init failed!\n");
-        return;
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        nvs_flash_erase();
+        nvs_flash_init();
     }
-    
-    // Configure sample format
-    esp_codec_dev_sample_info_t fs = {
-        .sample_rate = 16000,
-        .channel = 1,
-        .bits_per_sample = 16,
-    };
-    
-    // Open codec
-    esp_err_t ret = esp_codec_dev_open(spk_codec_dev, &fs);
-    if (ret != ESP_OK) {
-        printf("ERROR: Failed to open codec: %s\n", esp_err_to_name(ret));
-        return;
-    }
-    
-    // Set volume (0-100)
-    esp_codec_dev_set_out_vol(spk_codec_dev, 80.0);
-    
-    printf("Audio initialized\n");
-}
 
-// Audio playback task
-static void audio_task(void *args)
-{
-    while (1) {
-        if (audio_state.play_requested && audio_state.wav_start && audio_state.wav_end) {
-            audio_state.play_requested = false;
-            audio_state.is_playing = true;
-
-            size_t wav_size = audio_state.wav_end - audio_state.wav_start;
-            const uint8_t *pcm_data = audio_state.wav_start + 44;  // Skip WAV header
-            size_t pcm_size = wav_size - 44;
-
-            printf("Playing audio: %zu bytes\n", pcm_size);
-            
-            // Write audio data directly to codec
-            esp_codec_dev_write(spk_codec_dev, (void *)pcm_data, pcm_size);
-            
-            audio_state.is_playing = false;
-            printf("Audio complete\n");
+    nvs_handle_t handle;
+    if (nvs_open("tama", NVS_READWRITE, &handle) == ESP_OK) {
+        int32_t value = 0;
+        if (nvs_get_i32(handle, "words", &value) == ESP_OK) {
+            words_count = value;
         }
-
-        vTaskDelay(pdMS_TO_TICKS(10));
+        value = 0;
+        if (nvs_get_i32(handle, "health", &value) == ESP_OK) {
+            health_count = value;
+        }
+        nvs_close(handle);
     }
-    vTaskDelete(NULL);
 }
 
-static void play_wav(const uint8_t *wav_start, const uint8_t *wav_end)
+static void save_persisted_state(void)
 {
-    // If currently playing, stop it by closing and reopening codec
-    if (audio_state.is_playing) {
-        printf("Interrupting current playback\n");
-        esp_codec_dev_close(spk_codec_dev);
-        
-        // Reopen codec
-        esp_codec_dev_sample_info_t fs = {
-            .sample_rate = 16000,
-            .channel = 1,
-            .bits_per_sample = 16,
-        };
-        esp_codec_dev_open(spk_codec_dev, &fs);
-        esp_codec_dev_set_out_vol(spk_codec_dev, 80.0);
+    nvs_handle_t handle;
+    if (nvs_open("tama", NVS_READWRITE, &handle) == ESP_OK) {
+        nvs_set_i32(handle, "words", words_count);
+        nvs_set_i32(handle, "health", health_count);
+        nvs_commit(handle);
+        nvs_close(handle);
     }
-    
-    audio_state.wav_start = wav_start;
-    audio_state.wav_end = wav_end;
-    audio_state.play_requested = true;
+}
+
+static void sync_bold_text(lv_obj_t *base_label, lv_obj_t *bold_label)
+{
+    lv_label_set_text(bold_label, lv_label_get_text(base_label));
+}
+
+static void update_words_ui(void)
+{
+    int32_t clamped = words_count;
+    if (clamped < 0) clamped = 0;
+    if (clamped > 80000) clamped = 80000;
+    lv_bar_set_value(words_bar, clamped, LV_ANIM_OFF);
+    lv_label_set_text_fmt(words_value_label, "%" PRId32 "/80k", clamped);
+    if (words_value_label_bold) {
+        sync_bold_text(words_value_label, words_value_label_bold);
+    }
+}
+
+static void update_health_ui(void)
+{
+    int32_t clamped = health_count;
+    if (clamped < 0) clamped = 0;
+    if (clamped > 6) clamped = 6;
+    for (int32_t i = 0; i < 6; i++) {
+        lv_obj_set_style_opa(health_segments[i], i < clamped ? LV_OPA_COVER : LV_OPA_0, LV_PART_MAIN);
+    }
+}
+
+static void icon_event_cb(lv_event_t *e)
+{
+    lv_obj_t *target = lv_event_get_target(e);
+    if (target == icon_write) {
+        words_count += 250;
+        update_words_ui();
+        save_persisted_state();
+    } else if (target == icon_log) {
+        health_count += 1;
+        update_health_ui();
+        save_persisted_state();
+    } else if (target == icon_settings) {
+        health_count -= 1;
+        update_health_ui();
+        save_persisted_state();
+    } else if (target == icon_trophy) {
+        return;
+    }
+}
+
+static lv_obj_t *create_icon(lv_obj_t *parent, int32_t x, int32_t y, const char *symbol)
+{
+    lv_obj_t *container = lv_obj_create(parent);
+    lv_obj_set_size(container, 60, 60);
+    lv_obj_set_pos(container, x, y);
+    lv_obj_set_style_bg_opa(container, LV_OPA_0, LV_PART_MAIN);
+    lv_obj_set_style_border_width(container, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(container, 0, LV_PART_MAIN);
+    lv_obj_add_flag(container, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(container, icon_event_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *label = lv_label_create(container);
+    lv_label_set_text(label, symbol);
+    lv_obj_center(label);
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_36, LV_PART_MAIN);
+    lv_obj_set_style_text_color(label, lv_color_black(), LV_PART_MAIN);
+
+    return container;
+}
+
+static lv_obj_t *create_icon_image(lv_obj_t *parent, int32_t x, int32_t y, const lv_image_dsc_t *image)
+{
+    const int32_t icon_scale = (50 * 256) / 60;
+    lv_obj_t *container = lv_obj_create(parent);
+    lv_obj_set_size(container, 60, 60);
+    lv_obj_set_pos(container, x, y);
+    lv_obj_set_style_bg_opa(container, LV_OPA_0, LV_PART_MAIN);
+    lv_obj_set_style_border_width(container, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(container, 0, LV_PART_MAIN);
+    lv_obj_add_flag(container, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(container, icon_event_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *img = lv_image_create(container);
+    lv_image_set_src(img, image);
+    lv_image_set_scale(img, icon_scale);
+    lv_obj_center(img);
+
+    return container;
 }
 
 void app_main(void)
 {
+    load_persisted_state();
+
     lv_disp_t *disp = bsp_display_start();
+
+#if CONFIG_PM_ENABLE
+    esp_pm_config_t pm_config = {
+        .max_freq_mhz = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
+        .min_freq_mhz = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
+        .light_sleep_enable = false,
+    };
+    esp_pm_configure(&pm_config);
+#endif
 
     bsp_display_lock(0);
     lv_disp_set_rotation(disp, LV_DISP_ROTATION_270);
@@ -137,61 +173,118 @@ void app_main(void)
     bsp_display_lock(0);
 
     lv_obj_t *screen = lv_scr_act();
-    lv_obj_set_style_bg_color(screen, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+    lv_obj_t *bg_img = lv_image_create(screen);
+    lv_image_set_src(bg_img, &tamagotchi_bg);
+    lv_obj_align(bg_img, LV_ALIGN_TOP_LEFT, 0, 0);
+    lv_obj_move_background(bg_img);
 
-    lv_obj_t *label = lv_label_create(screen);
-    lv_obj_set_style_text_color(label, lv_color_hex(0x000000), LV_PART_MAIN);
-    lv_obj_set_style_text_font(label, &lv_font_montserrat_36, LV_PART_MAIN);
+    int32_t screen_w = lv_disp_get_hor_res(disp);
+    int32_t screen_h = lv_disp_get_ver_res(disp);
+    int32_t icon_total_w = (60 * 4) + (33 * 3);
+    int32_t start_x = (screen_w - icon_total_w) / 2;
+    int32_t y = 9;
 
-    int counter = 0;
-    char buf[16];
-    snprintf(buf, sizeof(buf), "%d", counter);
-    lv_label_set_text(label, buf);
-    lv_obj_center(label);
+    icon_write = create_icon_image(screen, start_x + (60 + 33) * 0, y, &write_icon);
+    icon_log = create_icon_image(screen, start_x + (60 + 33) * 1, y, &log_icon);
+    icon_trophy = create_icon_image(screen, start_x + (60 + 33) * 2, y, &trophy_icon);
+    icon_settings = create_icon_image(screen, start_x + (60 + 33) * 3, y, &settings_icon);
+
+    int32_t bar_height = 25;
+    int32_t words_bar_height = 31;
+    int32_t bar_gap = 4;
+    int32_t bar_right_pad = 54;
+    int32_t label_gap = 10;
+    int32_t label_x = 54;
+    int32_t bar_x = 0;
+    int32_t bar_w = 0;
+    int32_t bottom_bar_y = screen_h - 10 - bar_height;
+    int32_t top_bar_y = bottom_bar_y - bar_gap - words_bar_height;
+
+    lv_obj_t *words_label = lv_label_create(screen);
+    lv_label_set_text(words_label, "WORDS");
+    lv_obj_set_style_text_color(words_label, lv_color_black(), LV_PART_MAIN);
+    lv_obj_set_style_text_font(words_label, &lv_font_unscii_16, LV_PART_MAIN);
+    lv_obj_t *words_label_bold = lv_label_create(screen);
+    lv_label_set_text(words_label_bold, "WORDS");
+    lv_obj_set_style_text_color(words_label_bold, lv_color_black(), LV_PART_MAIN);
+    lv_obj_set_style_text_font(words_label_bold, &lv_font_unscii_16, LV_PART_MAIN);
+
+    lv_obj_t *health_label = lv_label_create(screen);
+    lv_label_set_text(health_label, "HEALTH");
+    lv_obj_set_style_text_color(health_label, lv_color_black(), LV_PART_MAIN);
+    lv_obj_set_style_text_font(health_label, &lv_font_unscii_16, LV_PART_MAIN);
+    lv_obj_t *health_label_bold = lv_label_create(screen);
+    lv_label_set_text(health_label_bold, "HEALTH");
+    lv_obj_set_style_text_color(health_label_bold, lv_color_black(), LV_PART_MAIN);
+    lv_obj_set_style_text_font(health_label_bold, &lv_font_unscii_16, LV_PART_MAIN);
+
+    words_value_label = lv_label_create(screen);
+    lv_label_set_text(words_value_label, "0/80k");
+    lv_obj_set_style_text_color(words_value_label, lv_color_black(), LV_PART_MAIN);
+    lv_obj_set_style_text_font(words_value_label, &lv_font_unscii_16, LV_PART_MAIN);
+    words_value_label_bold = lv_label_create(screen);
+    lv_label_set_text(words_value_label_bold, "0/80k");
+    lv_obj_set_style_text_color(words_value_label_bold, lv_color_black(), LV_PART_MAIN);
+    lv_obj_set_style_text_font(words_value_label_bold, &lv_font_unscii_16, LV_PART_MAIN);
+    lv_obj_update_layout(screen);
+    int32_t label_w = lv_obj_get_width(words_label_bold);
+    int32_t health_label_w = lv_obj_get_width(health_label_bold);
+    if (health_label_w > label_w) {
+        label_w = health_label_w;
+    }
+    bar_x = label_x + label_w + label_gap;
+    bar_w = screen_w - bar_x - bar_right_pad;
+
+    lv_obj_align(words_label, LV_ALIGN_TOP_LEFT, label_x, top_bar_y + 2);
+    lv_obj_align(words_label_bold, LV_ALIGN_TOP_LEFT, label_x + 1, top_bar_y + 2);
+
+    lv_obj_align(health_label, LV_ALIGN_TOP_LEFT, label_x, bottom_bar_y + 2);
+    lv_obj_align(health_label_bold, LV_ALIGN_TOP_LEFT, label_x + 1, bottom_bar_y + 2);
+
+    lv_obj_align(words_value_label, LV_ALIGN_TOP_RIGHT, -54, top_bar_y - 18);
+    lv_obj_align(words_value_label_bold, LV_ALIGN_TOP_RIGHT, -53, top_bar_y - 18);
+
+    words_bar = lv_bar_create(screen);
+    lv_obj_set_pos(words_bar, bar_x, top_bar_y);
+    lv_obj_set_size(words_bar, bar_w, words_bar_height);
+    lv_bar_set_range(words_bar, 0, 80000);
+    lv_obj_set_style_bg_opa(words_bar, LV_OPA_0, LV_PART_MAIN);
+    lv_obj_set_style_border_color(words_bar, lv_color_black(), LV_PART_MAIN);
+    lv_obj_set_style_border_width(words_bar, 2, LV_PART_MAIN);
+    lv_obj_set_style_radius(words_bar, 0, LV_PART_MAIN);
+    lv_obj_set_style_radius(words_bar, 0, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(words_bar, lv_color_black(), LV_PART_INDICATOR);
+
+    lv_obj_t *health_bar = lv_obj_create(screen);
+    lv_obj_set_pos(health_bar, bar_x, bottom_bar_y);
+    lv_obj_set_size(health_bar, bar_w, bar_height);
+    lv_obj_set_style_bg_opa(health_bar, LV_OPA_0, LV_PART_MAIN);
+    lv_obj_set_style_border_width(health_bar, 0, LV_PART_MAIN);
+    lv_obj_set_style_radius(health_bar, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(health_bar, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_column(health_bar, 2, LV_PART_MAIN);
+    lv_obj_set_flex_flow(health_bar, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(health_bar, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    int32_t segment_gap = 2;
+    int32_t segment_w = (bar_w - segment_gap * 5) / 6;
+    for (int32_t i = 0; i < 6; i++) {
+        health_segments[i] = lv_obj_create(health_bar);
+        lv_obj_set_size(health_segments[i], segment_w, bar_height);
+        lv_obj_set_style_bg_color(health_segments[i], lv_color_black(), LV_PART_MAIN);
+        lv_obj_set_style_border_width(health_segments[i], 0, LV_PART_MAIN);
+        lv_obj_set_style_radius(health_segments[i], 0, LV_PART_MAIN);
+    }
+
+    update_words_ui();
+    update_health_ui();
 
     bsp_display_unlock();
 
-    buttons_init();
-    audio_init();
-
-    xTaskCreate(audio_task, "audio_task", 4096, NULL, 5, NULL);
-
-    int last_inc = 0, last_dec = 0, last_rst = 0;
-
     while (1) {
-        int inc = (gpio_get_level(BTN_INC) == 0);
-        int dec = (gpio_get_level(BTN_DEC) == 0);
-        int rst = (gpio_get_level(BTN_RESET) == 0);
-
-        int inc_edge = inc && !last_inc;
-        int dec_edge = dec && !last_dec;
-        int rst_edge = rst && !last_rst;
-
-        if (inc_edge || dec_edge || rst_edge) {
-            if (rst_edge) {
-                counter = 0;
-                play_wav(reset_wav_start, reset_wav_end);
-            }
-            else if (dec_edge) {
-                counter--;
-                play_wav(dec_wav_start, dec_wav_end);
-            }
-            else if (inc_edge) {
-                counter++;
-                play_wav(inc_wav_start, inc_wav_end);
-            }
-
-            bsp_display_lock(0);
-            snprintf(buf, sizeof(buf), "%d", counter);
-            lv_label_set_text(label, buf);
-            lv_obj_center(label);
-            bsp_display_unlock();
-        }
-
-        last_inc = inc;
-        last_dec = dec;
-        last_rst = rst;
-
-        vTaskDelay(pdMS_TO_TICKS(30));
+        bsp_display_lock(0);
+        lv_timer_handler();
+        bsp_display_unlock();
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }

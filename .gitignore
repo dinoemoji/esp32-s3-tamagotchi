@@ -1,5 +1,7 @@
 /build/
 /managed_components/
+.cache/
+.DS_Store
 .sdkconfig.old
 *.log
 .vscode/
