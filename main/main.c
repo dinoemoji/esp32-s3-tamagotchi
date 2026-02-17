@@ -6,6 +6,8 @@
 #include "nvs_flash.h"
 #include "bsp/esp32_s3_touch_amoled_1_8.h"
 #include "lvgl.h"
+#include "assets/animations/animations.h"
+#include "assets/animations/tamagotchi_state.h"
 #if CONFIG_PM_ENABLE
 #include "esp_pm.h"
 #endif
@@ -28,6 +30,14 @@ static lv_obj_t *health_segments[6];
 static int32_t words_count = 0;
 static int32_t health_count = 6;
 
+// Animation system
+static tamagotchi_state_t tamagotchi_state;
+static animation_player_t anim_player;
+static lv_obj_t *tamagotchi_sprite = NULL;
+static uint32_t writing_anim_start_time = 0;
+static bool writing_anim_active = false;
+static tamagotchi_anim_t last_anim_type = TAMA_ANIM_PREHATCH;
+
 static void load_persisted_state(void)
 {
     esp_err_t err = nvs_flash_init();
@@ -48,6 +58,10 @@ static void load_persisted_state(void)
         }
         nvs_close(handle);
     }
+    
+    // Load tamagotchi state
+    tamagotchi_state_init(&tamagotchi_state);
+    tamagotchi_state_load(&tamagotchi_state);
 }
 
 static void save_persisted_state(void)
@@ -59,6 +73,9 @@ static void save_persisted_state(void)
         nvs_commit(handle);
         nvs_close(handle);
     }
+    
+    // Save tamagotchi state
+    tamagotchi_state_save(&tamagotchi_state);
 }
 
 static void sync_bold_text(lv_obj_t *base_label, lv_obj_t *bold_label)
@@ -94,6 +111,29 @@ static void icon_event_cb(lv_event_t *e)
     if (target == icon_write) {
         words_count += 250;
         update_words_ui();
+        
+        // Mark writing activity and handle health recovery if sick
+        mark_writing_activity(&tamagotchi_state);
+        if (tamagotchi_state.health == TAMA_HEALTH_SICK) {
+            // Increase health by 1 per consecutive writing day
+            if (tamagotchi_state.consecutive_writing_days > 0 && health_count < HEALTH_FULL) {
+                health_count++;
+                update_health_ui();
+                if (health_count >= HEALTH_FULL) {
+                    // Fully recovered - reset to healthy
+                    tamagotchi_state.consecutive_missed_days = 0;
+                }
+            }
+        }
+        
+        // Trigger writing animation if adult
+        if (tamagotchi_state.lifecycle == TAMA_LIFECYCLE_ADULT) {
+            writing_anim_active = true;
+            writing_anim_start_time = (xTaskGetTickCount() * portTICK_PERIOD_MS);
+            const animation_t *writing_anim = get_animation_for_type(TAMA_ANIM_WRITING);
+            animation_player_set_animation(&anim_player, writing_anim, true);
+        }
+        
         save_persisted_state();
     } else if (target == icon_log) {
         health_count += 1;
@@ -279,11 +319,73 @@ void app_main(void)
     update_words_ui();
     update_health_ui();
 
+    // Create Tamagotchi sprite for animations
+    tamagotchi_sprite = lv_image_create(screen);
+    lv_obj_align(tamagotchi_sprite, LV_ALIGN_CENTER, 0, -20);  // Position above center
+    
+    // Initialize animation player with starting animation
+    tamagotchi_state.lifecycle = calculate_lifecycle(words_count);
+    tamagotchi_state.health = calculate_health_status(tamagotchi_state.consecutive_missed_days);
+    tamagotchi_anim_t start_anim = get_current_animation(&tamagotchi_state, words_count, false);
+    const animation_t *anim = get_animation_for_type(start_anim);
+    animation_player_init(&anim_player, anim, tamagotchi_sprite, true);
+    animation_player_start(&anim_player);
+    last_anim_type = start_anim;
+
     bsp_display_unlock();
 
     while (1) {
+        uint32_t current_ms = (xTaskGetTickCount() * portTICK_PERIOD_MS);
+        
+        // Check for daily writing at 11:49 PM (or when date changes)
+        check_daily_writing(&tamagotchi_state);
+        
+        // Update tamagotchi state
+        tamagotchi_lifecycle_t new_lifecycle = calculate_lifecycle(words_count);
+        tamagotchi_health_t new_health = calculate_health_status(tamagotchi_state.consecutive_missed_days);
+        
+        // Update health count based on state
+        if (new_health == TAMA_HEALTH_DEAD) {
+            health_count = 0;
+        } else if (new_health == TAMA_HEALTH_SICK) {
+            // Health count already managed by writing activity
+        } else {
+            health_count = HEALTH_FULL;
+        }
+        
+        tamagotchi_state.lifecycle = new_lifecycle;
+        tamagotchi_state.health = new_health;
+        
+        // Check writing animation timeout (5 seconds)
+        if (writing_anim_active) {
+            uint32_t elapsed = current_ms - writing_anim_start_time;
+            if (elapsed >= WRITING_ANIM_DURATION_MS) {
+                writing_anim_active = false;
+            }
+        }
+        
+        // Determine current animation
+        tamagotchi_anim_t current_anim_type = get_current_animation(&tamagotchi_state, words_count, writing_anim_active);
+        
+        // Switch animation if needed
+        if (current_anim_type != last_anim_type) {
+            const animation_t *new_anim = get_animation_for_type(current_anim_type);
+            bool should_loop = (current_anim_type != TAMA_ANIM_CELEBRATE);
+            animation_player_set_animation(&anim_player, new_anim, should_loop);
+            last_anim_type = current_anim_type;
+            
+            // Mark celebration as played
+            if (current_anim_type == TAMA_ANIM_CELEBRATE) {
+                tamagotchi_state.celebration_played = true;
+            }
+        }
+        
         bsp_display_lock(0);
         lv_timer_handler();
+        
+        // Update animation player
+        animation_player_update(&anim_player, current_ms);
+        
         bsp_display_unlock();
         vTaskDelay(pdMS_TO_TICKS(10));
     }
