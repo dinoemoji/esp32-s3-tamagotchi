@@ -8,9 +8,19 @@
 #include "lvgl.h"
 #include "assets/animations/animations.h"
 #include "assets/animations/tamagotchi_state.h"
+#include "driver/gpio.h"
+#include "esp_log.h"
 #if CONFIG_PM_ENABLE
 #include "esp_pm.h"
 #endif
+
+static const char *TAG = "BTN";
+
+#define BTN_LEFT_GPIO   GPIO_NUM_41
+#define BTN_MIDDLE_GPIO GPIO_NUM_38
+#define BTN_RIGHT_GPIO  GPIO_NUM_17
+#define BTN_DEBOUNCE_MS 80
+#define ICON_COUNT      4
 
 LV_IMAGE_DECLARE(tamagotchi_bg);
 LV_IMAGE_DECLARE(write_icon);
@@ -37,6 +47,12 @@ static lv_obj_t *tamagotchi_sprite = NULL;
 static uint32_t writing_anim_start_time = 0;
 static bool writing_anim_active = false;
 static tamagotchi_anim_t last_anim_type = TAMA_ANIM_PREHATCH;
+
+// Button navigation state
+static int selected_icon = 0;
+static lv_obj_t *icon_containers[ICON_COUNT];
+static int btn_prev_level[3]    = {1, 1, 1};  // pull-up: idle HIGH
+static uint32_t btn_last_ms[3]  = {0, 0, 0};
 
 static void load_persisted_state(void)
 {
@@ -105,36 +121,79 @@ static void update_health_ui(void)
     }
 }
 
+static void buttons_init(void)
+{
+    const gpio_num_t pins[] = {BTN_LEFT_GPIO, BTN_MIDDLE_GPIO, BTN_RIGHT_GPIO};
+    for (int i = 0; i < 3; i++) {
+        gpio_config_t cfg = {
+            .pin_bit_mask = 1ULL << pins[i],
+            .mode         = GPIO_MODE_INPUT,
+            .pull_up_en   = GPIO_PULLUP_ENABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type    = GPIO_INTR_DISABLE,
+        };
+        gpio_config(&cfg);
+    }
+}
+
+static bool button_pressed(gpio_num_t gpio, int *prev_level, uint32_t *last_ms, uint32_t now_ms)
+{
+    int level = gpio_get_level(gpio);
+    bool pressed = false;
+    if (*prev_level == 1 && level == 0 && (now_ms - *last_ms) >= BTN_DEBOUNCE_MS) {
+        pressed = true;
+        *last_ms = now_ms;
+    }
+    *prev_level = level;
+    return pressed;
+}
+
+static void update_icon_highlight(void)
+{
+    for (int i = 0; i < ICON_COUNT; i++) {
+        if (i == selected_icon) {
+            lv_obj_set_style_bg_opa(icon_containers[i], LV_OPA_COVER, LV_PART_MAIN);
+            lv_obj_set_style_bg_color(icon_containers[i], lv_color_black(), LV_PART_MAIN);
+            lv_obj_set_style_image_recolor(lv_obj_get_child(icon_containers[i], 0), lv_color_white(), LV_PART_MAIN);
+            lv_obj_set_style_image_recolor_opa(lv_obj_get_child(icon_containers[i], 0), LV_OPA_COVER, LV_PART_MAIN);
+        } else {
+            lv_obj_set_style_bg_opa(icon_containers[i], LV_OPA_0, LV_PART_MAIN);
+            lv_obj_set_style_image_recolor_opa(lv_obj_get_child(icon_containers[i], 0), LV_OPA_0, LV_PART_MAIN);
+        }
+    }
+}
+
+static void do_write_action(void)
+{
+    words_count += 250;
+    update_words_ui();
+
+    mark_writing_activity(&tamagotchi_state);
+    if (tamagotchi_state.health == TAMA_HEALTH_SICK) {
+        if (tamagotchi_state.consecutive_writing_days > 0 && health_count < HEALTH_FULL) {
+            health_count++;
+            update_health_ui();
+            if (health_count >= HEALTH_FULL) {
+                tamagotchi_state.consecutive_missed_days = 0;
+            }
+        }
+    }
+
+    if (tamagotchi_state.lifecycle == TAMA_LIFECYCLE_ADULT) {
+        writing_anim_active = true;
+        writing_anim_start_time = (xTaskGetTickCount() * portTICK_PERIOD_MS);
+        const animation_t *writing_anim = get_animation_for_type(TAMA_ANIM_WRITING);
+        animation_player_set_animation(&anim_player, writing_anim, true);
+    }
+
+    save_persisted_state();
+}
+
 static void icon_event_cb(lv_event_t *e)
 {
     lv_obj_t *target = lv_event_get_target(e);
     if (target == icon_write) {
-        words_count += 250;
-        update_words_ui();
-        
-        // Mark writing activity and handle health recovery if sick
-        mark_writing_activity(&tamagotchi_state);
-        if (tamagotchi_state.health == TAMA_HEALTH_SICK) {
-            // Increase health by 1 per consecutive writing day
-            if (tamagotchi_state.consecutive_writing_days > 0 && health_count < HEALTH_FULL) {
-                health_count++;
-                update_health_ui();
-                if (health_count >= HEALTH_FULL) {
-                    // Fully recovered - reset to healthy
-                    tamagotchi_state.consecutive_missed_days = 0;
-                }
-            }
-        }
-        
-        // Trigger writing animation if adult
-        if (tamagotchi_state.lifecycle == TAMA_LIFECYCLE_ADULT) {
-            writing_anim_active = true;
-            writing_anim_start_time = (xTaskGetTickCount() * portTICK_PERIOD_MS);
-            const animation_t *writing_anim = get_animation_for_type(TAMA_ANIM_WRITING);
-            animation_player_set_animation(&anim_player, writing_anim, true);
-        }
-        
-        save_persisted_state();
+        do_write_action();
     } else if (target == icon_log) {
         health_count += 1;
         update_health_ui();
@@ -191,6 +250,7 @@ static lv_obj_t *create_icon_image(lv_obj_t *parent, int32_t x, int32_t y, const
 void app_main(void)
 {
     load_persisted_state();
+    buttons_init();
 
     lv_disp_t *disp = bsp_display_start();
 
@@ -228,6 +288,12 @@ void app_main(void)
     icon_log = create_icon_image(screen, start_x + (60 + 33) * 1, y, &log_icon);
     icon_trophy = create_icon_image(screen, start_x + (60 + 33) * 2, y, &trophy_icon);
     icon_settings = create_icon_image(screen, start_x + (60 + 33) * 3, y, &settings_icon);
+
+    icon_containers[0] = icon_write;
+    icon_containers[1] = icon_log;
+    icon_containers[2] = icon_trophy;
+    icon_containers[3] = icon_settings;
+    update_icon_highlight();
 
     int32_t bar_height = 25;
     int32_t words_bar_height = 31;
@@ -321,7 +387,8 @@ void app_main(void)
 
     // Create Tamagotchi sprite for animations
     tamagotchi_sprite = lv_image_create(screen);
-    lv_obj_align(tamagotchi_sprite, LV_ALIGN_CENTER, 0, -20);  // Position above center
+    lv_obj_set_pos(tamagotchi_sprite, 41, 78);
+    lv_obj_set_size(tamagotchi_sprite, 367, 210);
     
     // Initialize animation player with starting animation
     tamagotchi_state.lifecycle = calculate_lifecycle(words_count);
@@ -336,7 +403,40 @@ void app_main(void)
 
     while (1) {
         uint32_t current_ms = (xTaskGetTickCount() * portTICK_PERIOD_MS);
-        
+
+        // Poll GPIO buttons
+        bool left  = button_pressed(BTN_LEFT_GPIO,   &btn_prev_level[0], &btn_last_ms[0], current_ms);
+        bool mid   = button_pressed(BTN_MIDDLE_GPIO,  &btn_prev_level[1], &btn_last_ms[1], current_ms);
+        bool right = button_pressed(BTN_RIGHT_GPIO,   &btn_prev_level[2], &btn_last_ms[2], current_ms);
+
+        // Debug: log raw GPIO levels once per second
+        static uint32_t last_log_ms = 0;
+        if (current_ms - last_log_ms >= 1000) {
+            last_log_ms = current_ms;
+            ESP_LOGI(TAG, "GPIO%d=%d GPIO%d=%d GPIO%d=%d",
+                     BTN_LEFT_GPIO,   gpio_get_level(BTN_LEFT_GPIO),
+                     BTN_MIDDLE_GPIO, gpio_get_level(BTN_MIDDLE_GPIO),
+                     BTN_RIGHT_GPIO,  gpio_get_level(BTN_RIGHT_GPIO));
+        }
+
+        bool need_highlight_update = false;
+        bool need_write_action = false;
+
+        if (left && selected_icon > 0) {
+            ESP_LOGI(TAG, "LEFT press detected (GPIO%d)", BTN_LEFT_GPIO);
+            selected_icon--;
+            need_highlight_update = true;
+        }
+        if (right && selected_icon < ICON_COUNT - 1) {
+            ESP_LOGI(TAG, "RIGHT press detected (GPIO%d)", BTN_RIGHT_GPIO);
+            selected_icon++;
+            need_highlight_update = true;
+        }
+        if (mid && selected_icon == 0) {
+            ESP_LOGI(TAG, "MIDDLE press detected (GPIO%d)", BTN_MIDDLE_GPIO);
+            need_write_action = true;
+        }
+
         // Check for daily writing at 11:49 PM (or when date changes)
         check_daily_writing(&tamagotchi_state);
         
@@ -381,12 +481,42 @@ void app_main(void)
         }
         
         bsp_display_lock(0);
+
+        if (need_highlight_update) {
+            update_icon_highlight();
+        }
+        if (need_write_action) {
+            words_count += 250;
+            update_words_ui();
+            mark_writing_activity(&tamagotchi_state);
+            if (tamagotchi_state.health == TAMA_HEALTH_SICK) {
+                if (tamagotchi_state.consecutive_writing_days > 0 && health_count < HEALTH_FULL) {
+                    health_count++;
+                    update_health_ui();
+                    if (health_count >= HEALTH_FULL) {
+                        tamagotchi_state.consecutive_missed_days = 0;
+                    }
+                }
+            }
+            if (tamagotchi_state.lifecycle == TAMA_LIFECYCLE_ADULT) {
+                writing_anim_active = true;
+                writing_anim_start_time = current_ms;
+                const animation_t *writing_anim = get_animation_for_type(TAMA_ANIM_WRITING);
+                animation_player_set_animation(&anim_player, writing_anim, true);
+            }
+        }
+
         lv_timer_handler();
-        
+
         // Update animation player
         animation_player_update(&anim_player, current_ms);
-        
+
         bsp_display_unlock();
+
+        if (need_write_action) {
+            save_persisted_state();
+        }
+
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
